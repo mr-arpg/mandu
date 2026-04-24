@@ -1,0 +1,3 @@
+# Mandu
+
+React + Vite project.

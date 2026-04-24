@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+code/node_modules/
+
+# Build
+code/dist
+dist
+dist-ssr
+
+# Local data (recreated on run)
+database.sqlite
+
+# Environment
+.env
+.env.*
+
+# Logs, OS, editors
+*.log
+.DS_Store
+Thumbs.db
+.vscode
+.idea
+*.local

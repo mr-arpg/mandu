@@ -1,0 +1,29 @@
+# Project Context: Mandu 🥟
+Mandu is a hyper-minimalist, anti-anxiety productivity "operating system". It rejects traditional to-do list UIs (no checkboxes, no lists, no cluttered menus). It forces absolute focus by showing only ONE task at a time on an absolute black screen. 
+
+# Core Philosophy & UX
+- **Zero Mouse Policy:** The interface is 100% keyboard-driven. Users navigate via arrow keys and specific feature keys (M for Map/Constellation, A for Assist, N for New task, D for Divide task, U for User context, and Spacebar for completion).
+- **Anti-Anxiety:** No countdown timers. Time is represented visually or gently. 
+- **Hyper-Minimalism:** If an element isn't strictly necessary for the current task, do not render it.
+
+# Tech Stack
+- **Frontend:** React (Vite/Next.js setup), Tailwind CSS, Framer Motion (for fluid, mathematical layout animations).
+- **Backend:** Node.js, Express, SQLite (local `database.sqlite` file for easy porting to an Ubuntu server later).
+- **Communication:** Standard REST API / JSON over HTTP.
+
+# Design System (Tailwind)
+- **Colors:** - Background MUST be `#1E1E1E` (Dark gray, NOT absolute black).
+  - Main text and neutral elements MUST be "White" `#EDEBD7` (Cream/Off-white).
+  - Accent color (Mandu color) MUST be `#E3B23C` (Golden/Yellow).
+- **Typography:** - Font family MUST be "Elms Sans".
+  - The main Task text must be extremely bold/heavy (`font-black` or font-weight 900).
+  - All other text, including time indicators and UI helpers, must be strictly thin (`font-thin` or font-weight 100/300).
+- **Effects:** NO neon, NO glows, NO drop-shadows. The design is flat, elegant, and relies strictly on typography weight and the specific 3-color palette for hierarchy.
+- **Layout:** `w-screen h-screen overflow-hidden flex items-center justify-center bg-[#1E1E1E] text-[#EDEBD7]`. NO SCROLLBARS ever.
+
+# Coding Standards & AI Instructions
+1. **Never add traditional UI elements:** Do NOT generate standard navigation bars, hamburger menus, visible buttons, or visible input borders unless explicitly asked.
+2. **Component Structure:** Keep React components small. Separate animation logic from data fetching.
+3. **Mocking vs Real:** We are using a REAL local SQLite database from the start. Do not generate hardcoded mock arrays for tasks in the frontend. Always fetch from the API.
+4. **Language:** All variables, functions, API routes, and database schemas must be written in English.
+5. **Vibe Coding:** Prioritize smooth transitions and spatial awareness (e.g., zooming in/out of tasks) over instant hard-cuts.
