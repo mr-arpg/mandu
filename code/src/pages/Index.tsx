@@ -159,6 +159,11 @@ const Index = () => {
   /** Flips to true once the initial GET resolves, so we can distinguish first-load
    * from the "all tasks completed" empty state and show different copy in each case. */
   const [hasFetchedTasks, setHasFetchedTasks] = useState(false);
+  /**
+   * One-shot bottom feedback when starting/resuming with space.
+   * It fades out on its own, then the regular idle/paused hint takes over again.
+   */
+  const [spaceFeedback, setSpaceFeedback] = useState<{ id: number; text: string } | null>(null);
 
   useEffect(() => {
     const fetchTasks = async () => {
@@ -268,7 +273,7 @@ const Index = () => {
    *             task's own color, glow off
    * Must match the `duration` on the dissolve transitions in the render below.
    */
-  const COMPLETION_DISSOLVE_MS = 1000;
+  const COMPLETION_DISSOLVE_MS = 1200;
   /**
    * Tiny breath we hold the now-faded task in place after the dissolve finishes, before the
    * slide-out kicks in. Keeps the eye from jumping straight from "fading" into "sliding".
@@ -478,6 +483,9 @@ const Index = () => {
 
       const task = tasks[currentIndex];
       const taskId = task.id;
+      const timerBeforeToggle = timersByTaskId[taskId] ?? defaultTimerForTask(task);
+      const isStartingOrResuming = !timerBeforeToggle.isRunning;
+      const isFirstStart = timerBeforeToggle.remainingSeconds >= timerBeforeToggle.animationBaseSeconds;
 
       setTimersByTaskId((prev) => {
         const current =
@@ -511,6 +519,13 @@ const Index = () => {
 
         return next;
       });
+
+      if (isStartingOrResuming) {
+        setSpaceFeedback({
+          id: Date.now(),
+          text: isFirstStart ? "started!" : "continuing",
+        });
+      }
     };
 
     window.addEventListener("keydown", handleSpace);
@@ -518,7 +533,17 @@ const Index = () => {
     return () => {
       window.removeEventListener("keydown", handleSpace);
     };
-  }, [tasks, currentIndex, completingTaskId]);
+  }, [tasks, currentIndex, completingTaskId, timersByTaskId]);
+
+  useEffect(() => {
+    if (spaceFeedback === null) {
+      return;
+    }
+    const timeoutId = window.setTimeout(() => {
+      setSpaceFeedback((prev) => (prev?.id === spaceFeedback.id ? null : prev));
+    }, 2250);
+    return () => window.clearTimeout(timeoutId);
+  }, [spaceFeedback]);
 
   const currentTask = tasks[currentIndex];
   const currentTaskColor = currentTask?.color ?? "#EDEBD7";
@@ -570,7 +595,8 @@ const Index = () => {
             height: `${Math.min(100, Math.max(0, 100 - fillPercentage))}%`,
             backgroundColor: "#EDEBD7",
             opacity: 0.08,
-            transition: "height 1s linear",
+            // Freeze instantly on pause; keep smooth drip while running.
+            transition: currentTimer?.isRunning ? "height 1s linear" : "none",
           }}
         />
       )}
@@ -708,7 +734,7 @@ const Index = () => {
                       duration: isCurrentTaskCompleting
                         ? COMPLETION_DISSOLVE_MS / 1000
                         : 0.2,
-                      times: isCurrentTaskCompleting ? [0, 0.35, 0.55, 1] : undefined,
+                      times: isCurrentTaskCompleting ? [0, 0.35, 0.85, 1] : undefined,
                       ease: "easeInOut",
                     }}
                   >
@@ -721,22 +747,45 @@ const Index = () => {
         )}
       </main>
 
-      {/* Bottom hint — shows "press ⎵ to start" when idle, "paused" when paused, hidden when running. */}
-      {/* Also hidden during the completion dissolve, AND the moment the timer hits zero (so we
-          don't flash "paused" in the one render between isRunning=false and completingTaskId
-          being set by the observer effect). */}
-      {currentTimer?.isRunning !== true
-        && !isCurrentTaskCompleting
-        && currentTimer?.remainingSeconds !== 0
-        && tasks.length > 0 && (
+      {/* Looping status hint: "press ⎵ to start" (idle) / "paused" (paused).
+          Hidden during the completion dissolve, the moment the timer hits zero,
+          while the timer is running, and while the one-shot space feedback is on screen. */}
+      {!isCurrentTaskCompleting
+        && tasks.length > 0
+        && spaceFeedback === null
+        && currentTimer?.isRunning !== true
+        && currentTimer?.remainingSeconds !== 0 && (
         <motion.div
+          key={`status-hint-${isTimerActive ? "paused" : "idle"}`}
           className="absolute bottom-12 left-1/2 z-30 -translate-x-1/2 select-none text-lg font-thin tracking-wide text-mandu-white/80"
+          initial={{ opacity: 0.25 }}
           animate={{ opacity: [0.25, 1, 0.25] }}
-          transition={{ duration: 2.2, ease: "easeInOut", repeat: Infinity }}
+          transition={{
+            duration: isTimerActive ? 2.2 : 3.1,
+            ease: "easeInOut",
+            repeat: Infinity,
+            repeatType: "loop",
+          }}
         >
           {isTimerActive ? "paused" : "press ⎵ to start"}
         </motion.div>
       )}
+
+      {/* One-shot start/resume feedback ("started!" / "continuing") with a clean exit fade. */}
+      <AnimatePresence>
+        {!isCurrentTaskCompleting && tasks.length > 0 && spaceFeedback && (
+          <motion.div
+            key={`space-feedback-${spaceFeedback.id}`}
+            className="absolute bottom-12 left-1/2 z-30 -translate-x-1/2 select-none text-lg font-thin tracking-wide text-mandu-white/80"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: [0, 1, 0] }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 2.1, ease: "easeInOut", times: [0, 0.35, 1] }}
+          >
+            {spaceFeedback.text}
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 };
