@@ -17,7 +17,7 @@ export default {
     },
     extend: {
       colors: {
-        "mandu-bg": "#1E1E1E",
+        "mandu-bg": "#2F2E2D",
         "mandu-white": "#EDEBD7",
         "mandu-accent": "#E3B23C",
         border: "hsl(var(--border))",

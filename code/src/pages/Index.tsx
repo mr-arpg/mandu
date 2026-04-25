@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   AnimatePresence,
   animate,
@@ -14,15 +14,38 @@ import {
 type Task = {
   id: number;
   category: string;
+  /** Original duration ("1 min", "10 sec", ...). On a fresh task the wipe is sized
+   *  against this; on a reload-from-`current_time` the wipe is re-sized against the
+   *  remaining seconds so it always starts from the top (see `persistedTimerForTask`). */
   time: string;
+  /** Server-persisted remaining time. On natural completion this resets to `time` (the
+   *  original) so the next reload starts fresh. On pause / navigation / tab hide we save
+   *  the running task's remaining seconds here. */
+  current_time: string;
   text: string;
   color: string;
 };
 
 type TaskTimer = {
+  /**
+   * Discrete display value, updated once per second for the visible "X sec" / "X min"
+   * label. NOT the source of truth for the wipe — see the run-start timestamps below.
+   * When paused, this is also the snapshot we resume from.
+   */
   remainingSeconds: number;
+  /** Total duration the wipe is scaled against (full screen = 100% of this). */
   animationBaseSeconds: number;
   isRunning: boolean;
+  /**
+   * Time-based source of truth for the wipe and for "what's *really* left right now".
+   * `runStartedAt` is `performance.now()` at the moment the timer last toggled to
+   * running; `remainingAtRunStart` is what `remainingSeconds` was at that instant.
+   * Both are NULL while paused. The wipe RAF reads these every frame so the visible
+   * fill is always exact — no waiting for the next interval tick, no per-tick
+   * `animate(...)` chaining, no rate variance after pause/resume.
+   */
+  runStartedAt: number | null;
+  remainingAtRunStart: number | null;
 };
 
 const slideVariants = {
@@ -118,7 +141,83 @@ function defaultTimerForTask(task: Task): TaskTimer {
     remainingSeconds: seconds,
     animationBaseSeconds: Math.max(seconds, 1),
     isRunning: false,
+    runStartedAt: null,
+    remainingAtRunStart: null,
   };
+}
+
+/**
+ * Timer state to use whenever we're loading a task from the server (initial fetch,
+ * pre-init render fallbacks). `remainingSeconds` reads from the server-persisted
+ * `current_time`, falling back to the original `time` when nothing has been saved yet.
+ *
+ * `animationBaseSeconds` is pinned to `remainingSeconds`, NOT to the original `time`.
+ * That way a reload starts the wipe FROM THE TOP — invisible at first, then drains
+ * over the remaining seconds as the user runs the task. (If we used the original
+ * time as the base, a half-done task would come back with the wipe already half-way
+ * down the screen, which the user explicitly didn't want.)
+ */
+function persistedTimerForTask(task: Task): TaskTimer {
+  const remainingStr =
+    typeof task.current_time === "string" && task.current_time.trim()
+      ? task.current_time
+      : task.time;
+  const remainingSeconds = parseTimeToSeconds(remainingStr);
+  return {
+    remainingSeconds,
+    animationBaseSeconds: Math.max(remainingSeconds, 1),
+    isRunning: false,
+    runStartedAt: null,
+    remainingAtRunStart: null,
+  };
+}
+
+/**
+ * Live remaining seconds for a timer — the *real* number, accurate to the millisecond.
+ *
+ * When paused: just returns the snapshotted `remainingSeconds`.
+ * When running: returns `remainingAtRunStart - elapsed`, where `elapsed` is wall-clock
+ * time since the last play press. This is what every continuous visual (the wipe) and
+ * every persistence call should read; `timer.remainingSeconds` is only refreshed once
+ * per interval tick (it'd otherwise lag the actual time by up to a second).
+ */
+function liveRemaining(t: TaskTimer): number {
+  if (
+    !t.isRunning ||
+    t.runStartedAt === null ||
+    t.remainingAtRunStart === null
+  ) {
+    return Math.max(0, t.remainingSeconds);
+  }
+  const elapsed = (performance.now() - t.runStartedAt) / 1000;
+  return Math.max(0, t.remainingAtRunStart - elapsed);
+}
+
+/**
+ * Fire-and-forget PUT to write the current remaining-time back to the database. Format
+ * matches what `parseTimeToSeconds` understands ("X sec"). Failures are swallowed —
+ * losing one save is fine; the next pause / navigation / visibilitychange will retry.
+ */
+function persistCurrentTimeSeconds(taskId: number, seconds: number): void {
+  const value = `${Math.max(0, Math.floor(seconds))} sec`;
+  void fetch(`http://localhost:3001/api/tasks/${taskId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_time: value }),
+  }).catch(() => {});
+}
+
+/**
+ * Persist a verbatim `current_time` string (e.g. the original `task.time` when resetting
+ * after a natural completion). Useful when we want the DB to mirror a friendly "1 min"
+ * label rather than "60 sec".
+ */
+function persistCurrentTimeRaw(taskId: number, value: string): void {
+  void fetch(`http://localhost:3001/api/tasks/${taskId}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current_time: value }),
+  }).catch(() => {});
 }
 
 /**
@@ -127,7 +226,11 @@ function defaultTimerForTask(task: Task): TaskTimer {
  * useful for short timers and for the final countdown of any longer timer.
  */
 function formatRemainingAsMinutesLabel(remainingSeconds: number): string {
-  const whole = Math.max(0, Math.floor(remainingSeconds));
+  // CEIL, not floor: the label says "what's still left, rounded up". A timer that
+  // just started with 10 s should show "10 sec" until live actually drops below
+  // 10 (i.e. for the first full second), THEN "9 sec", and so on. With `floor`
+  // any sub-second progress would prematurely tick the label down.
+  const whole = Math.max(0, Math.ceil(remainingSeconds));
   if (whole < 60) {
     return `${whole} sec`;
   }
@@ -288,6 +391,12 @@ const Index = () => {
   const currentIndexRef = useRef(currentIndex);
   const timersByTaskIdRef = useRef(timersByTaskId);
   const completingTaskIdRef = useRef(completingTaskId);
+  /**
+   * How the current completion was triggered — drives the timer label during the
+   * dissolve and whether we POST `time: "done"`. Long-press / force = persist;
+   * natural time expiry = same golden animation, but "0 sec" and no DB change.
+   */
+  const completionKindRef = useRef<"forced" | "natural" | null>(null);
 
   useEffect(() => {
     tasksRef.current = tasks;
@@ -299,13 +408,13 @@ const Index = () => {
   const time = useTime();
 
   /**
-   * Continuously-interpolated current visible wipe bottom, in viewport % from the top.
-   * `animate(...)` ramps it linearly over 1 s every time `fillPercentage` ticks (or
-   * snaps it instantly when the timer is paused/reset). Used by both the wipe element
-   * AND the long-press fill's top so they line up to the pixel.
+   * Current visible wipe bottom, in viewport % from the top. Driven directly from
+   * `liveRemaining()` of the active task on every animation frame (see the RAF
+   * effect further down) — no per-tick `animate(target, 1s)` chains, no lag.
+   * Used by both the wipe element AND the long-press fill's top so they line up
+   * to the pixel.
    */
   const wipeBottomMv = useMotionValue(0);
-  const wipeAnimRef = useRef<AnimationPlaybackControls | null>(null);
 
   /**
    * Extra descent below the wipe, in viewport %. Stays at 0 during charging/fading
@@ -370,47 +479,62 @@ const Index = () => {
       const next = { ...prev };
       for (const task of tasks) {
         if (next[task.id] === undefined) {
-          next[task.id] = defaultTimerForTask(task);
+          // First time we see this task: hydrate from the server-persisted `current_time`
+          // (so reloads pick up where the user left off). Already-initialised tasks are
+          // left alone so their live ticking state doesn't get clobbered.
+          next[task.id] = persistedTimerForTask(task);
         }
       }
       return next;
     });
   }, [tasks]);
 
+  /**
+   * Discrete label tick. Polls 4× per second so the visible "X sec" / "X min" label
+   * crosses second-boundaries within ~250 ms of when it should — without spamming
+   * React with re-renders (we only commit when `ceil(live)` actually changed). The
+   * wipe is NOT driven from here; it's RAF-time-based (see below).
+   *
+   * Auto-pause: as soon as a task's live remaining hits zero, drop `isRunning` and
+   * clear the run timestamps on the same tick. The completion observer takes it
+   * from there. No more "1-second buffer" effect — the wipe is always exact, so
+   * there's nothing left to wait for.
+   */
   useEffect(() => {
     const intervalId = window.setInterval(() => {
       setTimersByTaskId((prev) => {
-        const runningEntry = Object.entries(prev).find(([, v]) => v.isRunning);
-        if (!runningEntry) {
-          return prev;
-        }
-
-        const taskId = Number(runningEntry[0]);
-        const t = runningEntry[1];
-
-        // The tick that lands on 0: stop the timer. The completion handoff is done by a
-        // separate observer effect below — doing it here from inside the updater (or via
-        // a closure variable read right after) is racy under React 18's auto-batching.
-        if (t.remainingSeconds <= 1) {
-          return {
-            ...prev,
-            [taskId]: {
+        let changed = false;
+        let next: Record<number, TaskTimer> | null = null;
+        for (const [idStr, t] of Object.entries(prev)) {
+          if (!t.isRunning) {
+            continue;
+          }
+          const live = liveRemaining(t);
+          if (live <= 0) {
+            if (!next) next = { ...prev };
+            next[Number(idStr)] = {
               ...t,
               remainingSeconds: 0,
               isRunning: false,
-            },
-          };
+              runStartedAt: null,
+              remainingAtRunStart: null,
+            };
+            changed = true;
+            continue;
+          }
+          // The label is `ceil(remainingSeconds)`, so a re-render is only
+          // worthwhile when `ceil(live)` actually crossed an integer boundary.
+          const ceiledLive = Math.ceil(live);
+          const ceiledCur = Math.ceil(t.remainingSeconds);
+          if (ceiledLive !== ceiledCur) {
+            if (!next) next = { ...prev };
+            next[Number(idStr)] = { ...t, remainingSeconds: live };
+            changed = true;
+          }
         }
-
-        return {
-          ...prev,
-          [taskId]: {
-            ...t,
-            remainingSeconds: t.remainingSeconds - 1,
-          },
-        };
+        return changed && next ? next : prev;
       });
-    }, 1000);
+    }, 250);
 
     return () => window.clearInterval(intervalId);
   }, []);
@@ -437,6 +561,7 @@ const Index = () => {
     }
     const pendingId = toFinishId;
     const timeoutId = window.setTimeout(() => {
+      completionKindRef.current = "natural";
       setCompletingTaskId(pendingId);
     }, COMPLETION_PRE_DELAY_MS);
     return () => window.clearTimeout(timeoutId);
@@ -492,7 +617,14 @@ const Index = () => {
   const SHAKE_PHASE1_TARGET = 0.4;
   const WIPING_BASE_PCT_PER_SEC = 25;
   const WIPING_ACCEL_PCT_PER_SEC2 = 20;
-  const DRAIN_DURATION_S = 0.45;
+  const DRAIN_DURATION_S = 0.62;
+  /**
+   * Cubic-bezier ease-in with mild inertia at the head — velocity starts low
+   * (the bar still has a hint of "mass" before falling) and accelerates
+   * smoothly. Less aggressive than a strong ease-in so the speed-up reads as
+   * natural, not as a sudden snap.
+   */
+  const DRAIN_EASE: [number, number, number, number] = [0.42, 0, 0.72, 0.46];
   const RELEASE_FADE_DURATION_S = 0.32;
   const SHAKE_FADE_MS = 260;
 
@@ -501,11 +633,41 @@ const Index = () => {
       return;
     }
     const finishedId = completingTaskId;
+    const kindAtTrigger = completionKindRef.current;
 
     const timeoutId = window.setTimeout(() => {
-      // Fire-and-forget the persistence; UI removes the task either way so the server can
-      // catch up at its own pace. If it fails, we just log — the worst case is the row
-      // reappears on next page load with its original time, and the user can let it run again.
+      if (kindAtTrigger === "natural") {
+        // Natural expiry: keep the task in the list (same position, same category)
+        // but reset its timer to the initial "X min/sec" — so the next time the
+        // user comes back to it (Left arrow) it's a fresh run, not stuck at 0.
+        // Persist `current_time = task.time` so a reload also starts fresh.
+        // After the dissolve we slide to the NEXT task (the user explicitly
+        // doesn't want to remain on the just-finished task).
+        const tasksNow = tasksRef.current;
+        const finishedTask = tasksNow.find((t) => t.id === finishedId);
+        if (finishedTask) {
+          setTimersByTaskId((prev) => ({
+            ...prev,
+            [finishedId]: defaultTimerForTask(finishedTask),
+          }));
+          // Mirror the local reset on the server using the friendly original label
+          // (e.g. "1 min" rather than "60 sec").
+          persistCurrentTimeRaw(finishedId, finishedTask.time);
+        }
+        completionKindRef.current = null;
+        setCompletingTaskId(null);
+
+        // Slide forward to the next task in the cycle. With >1 task this triggers
+        // the AnimatePresence exit/enter (key changes via currentTask.id). With a
+        // single task there's nowhere to go — we just stay put.
+        if (tasksNow.length > 1) {
+          setDirection(1);
+          setCurrentIndex((idx) => (idx + 1) % tasksNow.length);
+        }
+        return;
+      }
+
+      // Forced (long-press) completion: persist `done`, drop locally, slide on.
       void (async () => {
         try {
           const res = await fetch(`http://localhost:3001/api/tasks/${finishedId}`, {
@@ -520,6 +682,7 @@ const Index = () => {
           console.error("Network error marking task as done:", err);
         }
       })();
+      completionKindRef.current = null;
 
       // Drop the finished task locally and clamp `currentIndex` to a still-valid slot so
       // AnimatePresence (keyed on task id) slides the next task into place.
@@ -664,6 +827,16 @@ const Index = () => {
         }
       }
 
+      // Snapshot the remaining time of any running task before we switch away.
+      // The task keeps ticking silently (we don't pause it), but a save now means
+      // a reload while we're elsewhere still gets reasonably-fresh state. Read
+      // via ref so we always see the latest tick, not a render-stale closure.
+      for (const [idStr, t] of Object.entries(timersByTaskIdRef.current)) {
+        if (t.isRunning) {
+          persistCurrentTimeSeconds(Number(idStr), liveRemaining(t));
+        }
+      }
+
       if (key === "ArrowRight") {
         setDirection(1);
         setCurrentIndex((prev) => (prev + 1) % tasks.length);
@@ -753,28 +926,51 @@ const Index = () => {
         return;
       }
       const taskId = task.id;
-      const timerBeforeToggle = timersNow[taskId] ?? defaultTimerForTask(task);
+      const timerBeforeToggle = timersNow[taskId] ?? persistedTimerForTask(task);
       const isStartingOrResuming = !timerBeforeToggle.isRunning;
       const isFirstStart =
         timerBeforeToggle.remainingSeconds >= timerBeforeToggle.animationBaseSeconds;
 
       setTimersByTaskId((prev) => {
-        const current = prev[taskId] ?? defaultTimerForTask(task);
-        // PAUSE: freeze infill exactly where it is — touch nothing except isRunning.
+        const current = prev[taskId] ?? persistedTimerForTask(task);
+        // PAUSE: snapshot the LIVE remaining (sub-second accurate) into the discrete
+        // field, drop the run timestamps. Persist while we're at it.
         if (current.isRunning) {
-          return { ...prev, [taskId]: { ...current, isRunning: false } };
+          const live = liveRemaining(current);
+          persistCurrentTimeSeconds(taskId, live);
+          return {
+            ...prev,
+            [taskId]: {
+              ...current,
+              isRunning: false,
+              remainingSeconds: live,
+              runStartedAt: null,
+              remainingAtRunStart: null,
+            },
+          };
         }
         // RESUME / START: activate this task; reset other tasks' infill to 100%.
+        // For the activated task we capture `performance.now()` and the value we're
+        // resuming from — those two together are the time-based source of truth for
+        // the wipe. Other tasks have their run timestamps cleared (they're paused).
+        const startNow = performance.now();
         const next: Record<number, TaskTimer> = {};
         for (const [id, timer] of Object.entries(prev)) {
           const numId = Number(id);
           if (numId === taskId) {
-            next[numId] = { ...timer, isRunning: true };
+            next[numId] = {
+              ...timer,
+              isRunning: true,
+              runStartedAt: startNow,
+              remainingAtRunStart: timer.remainingSeconds,
+            };
           } else {
             next[numId] = {
               ...timer,
               isRunning: false,
               animationBaseSeconds: Math.max(timer.remainingSeconds, 1),
+              runStartedAt: null,
+              remainingAtRunStart: null,
             };
           }
         }
@@ -800,14 +996,30 @@ const Index = () => {
       if (!task) {
         return;
       }
-      // Stop the timer first so the existing completion observer doesn't double-fire.
+      // Stop the timer + force `remainingSeconds` to 0. That second part is what
+      // makes the wipe drop to 100% (fully covering the screen) underneath the
+      // long-press gradient — so when the gradient fades out during the "done"
+      // dissolve, the user sees a fully-grey screen instead of the half-wiped
+      // mid-screen line they were complaining about.
+      // The label still reads "done" (not "0 sec") because `completionTimerLabel`
+      // overrides whatever `remainingSeconds` would format to during completion.
       setTimersByTaskId((prev) => {
         const t = prev[task.id];
         if (!t) {
           return prev;
         }
-        return { ...prev, [task.id]: { ...t, isRunning: false } };
+        return {
+          ...prev,
+          [task.id]: {
+            ...t,
+            isRunning: false,
+            remainingSeconds: 0,
+            runStartedAt: null,
+            remainingAtRunStart: null,
+          },
+        };
       });
+      completionKindRef.current = "forced";
       setCompletingTaskId(task.id);
     };
 
@@ -962,7 +1174,7 @@ const Index = () => {
       holdDrainAnimRef.current = animate(holdExtraMv, 0, {
         type: "tween",
         duration: DRAIN_DURATION_S,
-        ease: [0.4, 0, 0.2, 1],
+        ease: DRAIN_EASE,
         onComplete: () => {
           holdDrainAnimRef.current = null;
           holdExtraMv.set(0);
@@ -1152,6 +1364,33 @@ const Index = () => {
     return () => window.clearTimeout(timeoutId);
   }, [spaceFeedback]);
 
+  /**
+   * Save the running task's remaining time when the tab is being hidden / closed.
+   * Covers the "user closes the browser" case that pause / navigation persistence
+   * misses. `pagehide` fires on actual unloads (incl. mobile safari), and
+   * `visibilitychange → hidden` fires on tab swaps and minimize.
+   */
+  useEffect(() => {
+    const flushRunning = () => {
+      for (const [idStr, t] of Object.entries(timersByTaskIdRef.current)) {
+        if (t.isRunning) {
+          persistCurrentTimeSeconds(Number(idStr), liveRemaining(t));
+        }
+      }
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "hidden") {
+        flushRunning();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("pagehide", flushRunning);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("pagehide", flushRunning);
+    };
+  }, []);
+
   const currentTask = tasks[currentIndex];
   const currentTaskColor = currentTask?.color ?? "#EDEBD7";
   const isLongText = currentTask ? currentTask.text.length > 55 : false;
@@ -1160,46 +1399,78 @@ const Index = () => {
     currentTask && timersByTaskId[currentTask.id] !== undefined
       ? timersByTaskId[currentTask.id]
       : currentTask
-        ? defaultTimerForTask(currentTask)
+        ? persistedTimerForTask(currentTask)
         : null;
-
-  const fillPercentage =
-    currentTimer && currentTimer.animationBaseSeconds > 0
-      ? (currentTimer.remainingSeconds / currentTimer.animationBaseSeconds) * 100
-      : 100;
 
   const displayedTimeLabel = currentTimer
     ? formatRemainingAsMinutesLabel(currentTimer.remainingSeconds)
     : "";
 
   /**
-   * Drive `wipeBottomMv` continuously between timer ticks. When running we ramp
-   * linearly over the full 1 s tick interval (matching the old CSS transition); when
-   * paused/idle we snap so a paused wipe doesn't keep gliding.
-   *
-   * This is what fixes the "long press starts ahead of the wipe" bug: both the wipe
-   * element and the long-press fill's top read off the same continuously-interpolated
-   * motion value, so they line up to the pixel.
+   * On task change (incl. after long-press removes a row) or when the list
+   * empties, hard-reset the wipe to this task's progress. The RAF loop below
+   * would catch up on the next frame, but seeding the value synchronously here
+   * avoids one frame of stale wipe (e.g. previous task's full grey flashing in)
+   * when the new task slides into place.
    */
-  const isWipeRunning = currentTimer?.isRunning === true;
+  useLayoutEffect(() => {
+    if (tasks.length === 0) {
+      wipeBottomMv.set(0);
+      return;
+    }
+    if (currentTask === undefined) {
+      return;
+    }
+    const t =
+      timersByTaskId[currentTask.id] ?? persistedTimerForTask(currentTask);
+    const live = liveRemaining(t);
+    const fp = t.animationBaseSeconds > 0
+      ? (live / t.animationBaseSeconds) * 100
+      : 100;
+    wipeBottomMv.set(Math.min(100, Math.max(0, 100 - fp)));
+  }, [currentTask?.id, tasks.length, currentTask, timersByTaskId, wipeBottomMv]);
+
+  /**
+   * Wipe driver — continuous, time-based, exact. Every frame we read the current
+   * task's timer, ask `liveRemaining()` what's *really* left right now (down to
+   * the millisecond), and write the corresponding wipe target straight into
+   * `wipeBottomMv`. The visible fill is therefore always current — no waiting
+   * for the next interval tick, no `animate(target, 1s)` chains drifting
+   * behind reality, no rate variance after pause/resume.
+   *
+   * When the task is paused, `liveRemaining` just returns the snapshotted
+   * `remainingSeconds`, which doesn't change between frames, so the wipe sits
+   * still. When the user hits Space the wipe starts moving on the very next
+   * frame (~16 ms), not on the next 1-second tick boundary.
+   */
   useEffect(() => {
-    const target = Math.min(100, Math.max(0, 100 - fillPercentage));
-    if (wipeAnimRef.current) {
-      wipeAnimRef.current.stop();
-      wipeAnimRef.current = null;
-    }
-    if (isWipeRunning) {
-      wipeAnimRef.current = animate(wipeBottomMv, target, {
-        duration: 1,
-        ease: "linear",
-        onComplete: () => {
-          wipeAnimRef.current = null;
-        },
-      });
-    } else {
+    let rafId: number | null = null;
+    const tick = () => {
+      rafId = requestAnimationFrame(tick);
+      const tasksNow = tasksRef.current;
+      const idx = currentIndexRef.current;
+      const cur = tasksNow[idx];
+      if (!cur) {
+        return;
+      }
+      const t = timersByTaskIdRef.current[cur.id];
+      if (!t) {
+        return;
+      }
+      const live = liveRemaining(t);
+      const fp = t.animationBaseSeconds > 0
+        ? (live / t.animationBaseSeconds) * 100
+        : 100;
+      const target = Math.min(100, Math.max(0, 100 - fp));
       wipeBottomMv.set(target);
-    }
-  }, [fillPercentage, isWipeRunning, wipeBottomMv]);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => {
+      if (rafId !== null) {
+        cancelAnimationFrame(rafId);
+      }
+    };
+  }, [wipeBottomMv]);
 
   /**
    * Long-press fill geometry. The fill is top-anchored at 0 (same as the wipe)
@@ -1236,15 +1507,18 @@ const Index = () => {
 
   const isTimerActive = currentTimer ? currentTimer.isRunning || currentTimer.remainingSeconds < currentTimer.animationBaseSeconds : false;
   const isCurrentTaskCompleting = currentTask !== undefined && currentTask.id === completingTaskId;
+  const completionTimerLabel =
+    completionKindRef.current === "natural"
+      ? formatRemainingAsMinutesLabel(0)
+      : "done";
 
   return (
     <div className="relative flex min-h-screen w-full items-center justify-center overflow-hidden bg-mandu-bg text-mandu-white">
 
       {/* Full-screen color wipe — drains downward as time passes. Height is driven
-          off the shared `wipeBottomMv` motion value (see the sync `useEffect` above)
-          so it interpolates continuously between the once-per-second `fillPercentage`
-          ticks AND so the long-press fill's top can read the same value to line up
-          to the pixel. */}
+          off the shared `wipeBottomMv` motion value, which is itself updated every
+          frame from `liveRemaining(currentTimer)` by the RAF effect above. The
+          long-press fill's top reads the same value so the two stay pixel-aligned. */}
       {tasks.length > 0 && isTimerActive && (
         <motion.div
           className="pointer-events-none absolute inset-x-0 top-0 z-0"
@@ -1274,7 +1548,7 @@ const Index = () => {
             height: holdHeightStr,
             opacity: holdOpacityMv,
             /* Stops are fully opaque (no see-through to the base timer wipe).
-               Top stop (#2F2E2D) is the EXACT pre-mix of `bg-mandu-bg #1E1E1E`
+               Top stop (#3E3D3B) is the EXACT pre-mix of `bg-mandu-bg #2F2E2D`
                with the wipe overlay `#EDEBD7 @ 8%`, so the joint between the
                regular wipe area and the charged gradient at top is invisible.
                background-size 100%×100vh + no-repeat anchors the gradient to the
@@ -1283,11 +1557,11 @@ const Index = () => {
                the leading edge naturally brightens as the fill descends). */
             background:
               "linear-gradient(to bottom, " +
-              "#2F2E2D 0%, " +
-              "#4A3F2A 8%, " +
-              "#7A5F2F 18%, " +
-              "#A77F37 30%, " +
-              "#C99A3A 44%, " +
+              "#3E3D3B 0%, " +
+              "#564730 8%, " +
+              "#856836 18%, " +
+              "#AE863B 30%, " +
+              "#CE9D3D 44%, " +
               "#E3B23C 60%, " +
               "#F0C14F 74%, " +
               "#F8DA80 86%, " +
@@ -1362,7 +1636,16 @@ const Index = () => {
                 initial="enter"
                 animate="center"
                 exit="exit"
-                transition={{ type: "spring", stiffness: 150, damping: 38, mass: 1.1 }}
+                /*
+                 * Tween, NOT a spring. Springs (especially overdamped ones) approach
+                 * the target asymptotically — Framer settles them when below
+                 * `restDelta`/`restSpeed` thresholds and SNAPS the value to the
+                 * exact target on completion. Visually that read as "the slide
+                 * stops early and then jerks the last pixels into the centre",
+                 * which the user noticed. A tween of fixed duration / cubic ease
+                 * lands precisely at `x: 0` every time, no last-frame correction.
+                 */
+                transition={{ duration: 0.7, ease: [0.22, 1, 0.36, 1] }}
                 className="w-full"
               >
                 <div
@@ -1387,7 +1670,9 @@ const Index = () => {
                         exit={{ opacity: 0 }}
                         transition={{ duration: 0.25, ease: "easeInOut" }}
                       >
-                        {isCurrentTaskCompleting ? "done" : displayedTimeLabel}
+                        {isCurrentTaskCompleting
+                          ? completionTimerLabel
+                          : displayedTimeLabel}
                       </motion.span>
                     </AnimatePresence>
                   </span>
@@ -1525,14 +1810,14 @@ const Index = () => {
         </motion.div>
       )}
 
-      {/* One-shot start/resume feedback ("started!" / "continuing") with a clean exit fade. */}
+      {/* One-shot start/resume feedback: instant full opacity, then fade out only. */}
       <AnimatePresence>
         {!isCurrentTaskCompleting && tasks.length > 0 && spaceFeedback && (
           <motion.div
             key={`space-feedback-${spaceFeedback.id}`}
             className="absolute bottom-12 left-1/2 z-30 -translate-x-1/2 select-none text-lg font-thin tracking-wide text-mandu-white/80"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: [0, 1, 0] }}
+            initial={{ opacity: 1 }}
+            animate={{ opacity: [1, 1, 0] }}
             exit={{ opacity: 0 }}
             transition={{ duration: 2.1, ease: "easeInOut", times: [0, 0.35, 1] }}
           >
