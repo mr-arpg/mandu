@@ -1,5 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import {
+  AnimatePresence,
+  animate,
+  motion,
+  useMotionTemplate,
+  useMotionValue,
+  useTime,
+  useTransform,
+  type AnimationPlaybackControls,
+  type MotionValue,
+} from "framer-motion";
 
 type Task = {
   id: number;
@@ -125,6 +135,84 @@ function formatRemainingAsMinutesLabel(remainingSeconds: number): string {
   return `${minutes} min`;
 }
 
+/**
+ * Shake amplitude as a function of hold progress (0..1). Curve is `p^1.6` so the shake
+ * is barely perceptible at the start of the hold and ramps up sharply near the top.
+ * Centralised here so both the (no-longer-used) word-level approach and the per-letter
+ * `ShakingLetter` below agree on the easing.
+ */
+const shakeAmp = (p: number) =>
+  Math.pow(Math.max(0, Math.min(1, p)), 1.6);
+
+type ShakingLetterProps = {
+  char: string;
+  /** 0-based index in the FULL task text (not within a word) — used to phase-offset
+   *  this letter's oscillations from its neighbours so the whole word doesn't move in
+   *  unison. */
+  letterIndex: number;
+  time: MotionValue<number>;
+  /** 0..1 amplitude scalar. Driven by hold progress while pressing and faded to 0
+   *  shortly after release, independent of the drain animation on the fill itself. */
+  shakeIntensityMv: MotionValue<number>;
+  taskColor: string;
+  isCompleting: boolean;
+  completionDurationMs: number;
+};
+
+/**
+ * One letter of the task text, with its own independent jitter driven by motion values
+ * shared at the parent level (`time`, `shakeIntensityMv`). Each letter's phase is
+ * offset by `letterIndex * 137` (a golden-ratio-ish multiplier) so adjacent letters
+ * never line up — the result reads as chaotic per-letter buzzing rather than a single
+ * rigid wave.
+ *
+ * Color/opacity/textShadow during the completion dissolve are set by the parent
+ * `motion.span`; CSS inheritance carries them onto every letter automatically.
+ */
+const ShakingLetter = ({
+  char,
+  letterIndex,
+  time,
+  shakeIntensityMv,
+}: ShakingLetterProps) => {
+  const phase = letterIndex * 137;
+
+  const x = useTransform([time, shakeIntensityMv], (latest) => {
+    const [t, p] = latest as [number, number];
+    return (
+      (Math.sin((t + phase) / 13) + Math.sin((t + phase * 2) / 7) * 0.45) *
+      shakeAmp(p) *
+      6
+    );
+  });
+  const y = useTransform([time, shakeIntensityMv], (latest) => {
+    const [t, p] = latest as [number, number];
+    return (
+      (Math.cos((t + phase * 1.3) / 15) +
+        Math.cos((t + phase * 2.1) / 9) * 0.45) *
+      shakeAmp(p) *
+      5
+    );
+  });
+  const rotate = useTransform([time, shakeIntensityMv], (latest) => {
+    const [t, p] = latest as [number, number];
+    return Math.sin((t + phase * 0.7) / 21) * shakeAmp(p) * 3;
+  });
+
+  return (
+    <motion.span
+      style={{
+        display: "inline-block",
+        x,
+        y,
+        rotate,
+      }}
+    >
+      {char}
+    </motion.span>
+  );
+};
+
 const Index = () => {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
@@ -164,6 +252,87 @@ const Index = () => {
    * It fades out on its own, then the regular idle/paused hint takes over again.
    */
   const [spaceFeedback, setSpaceFeedback] = useState<{ id: number; text: string } | null>(null);
+  /**
+   * Long-press "force complete" state machine. Four phases:
+   *
+   *   1. CHARGING — gradient fades IN over the existing timer wipe (same area:
+   *      top → wipe-bottom). The wipe LOOKS like it's transforming into the
+   *      gradient; the underlying grey wipe is still there, just covered as
+   *      `holdOpacityMv` ramps 0 → 1. Letters start buzzing (shake step 1).
+   *   2. WIPING  — gradient bleeds BELOW the wipe; `holdExtraMv` accelerates
+   *      gently while held. The fill's bottom descends faster than the natural
+   *      wipe. Letters intensify (shake step 2).
+   *   3. DRAINING — on release, `holdExtraMv` tweens back to 0 (no bounce) so
+   *      the bright bottom edge meets the real wipe line again.
+   *   4. FADING  — gradient fades OUT (`holdOpacityMv` 1 → 0) revealing the
+   *      regular grey wipe underneath.
+   *
+   * Throughout, height is always `wipeBottomMv + holdExtraMv` so the fill stays
+   * glued to the wipe in real time (charging/fading: `holdExtraMv = 0`, draining:
+   * shrinking to 0, wiping: growing).
+   */
+  const holdStateRef = useRef<
+    "idle" | "charging" | "wiping" | "draining" | "fading"
+  >("idle");
+  const holdTimeoutRef = useRef<number | null>(null);
+  const holdRafRef = useRef<number | null>(null);
+  const isPressingRef = useRef(false);
+  const wipingLastTickRef = useRef(0);
+  const wipingPhaseStartRef = useRef(0);
+  /**
+   * Mirror of every state value the keyboard handlers need to read but should NOT cause
+   * the listener effect to re-run when they change. The handler effect runs once on mount
+   * and reads from these refs at event time.
+   */
+  const tasksRef = useRef(tasks);
+  const currentIndexRef = useRef(currentIndex);
+  const timersByTaskIdRef = useRef(timersByTaskId);
+  const completingTaskIdRef = useRef(completingTaskId);
+
+  useEffect(() => {
+    tasksRef.current = tasks;
+    currentIndexRef.current = currentIndex;
+    timersByTaskIdRef.current = timersByTaskId;
+    completingTaskIdRef.current = completingTaskId;
+  });
+
+  const time = useTime();
+
+  /**
+   * Continuously-interpolated current visible wipe bottom, in viewport % from the top.
+   * `animate(...)` ramps it linearly over 1 s every time `fillPercentage` ticks (or
+   * snaps it instantly when the timer is paused/reset). Used by both the wipe element
+   * AND the long-press fill's top so they line up to the pixel.
+   */
+  const wipeBottomMv = useMotionValue(0);
+  const wipeAnimRef = useRef<AnimationPlaybackControls | null>(null);
+
+  /**
+   * Extra descent below the wipe, in viewport %. Stays at 0 during charging/fading
+   * (fill just overlays the wipe), grows during wiping (fill dips below the wipe),
+   * springs back to 0 during draining. Total visible fill height = `wipeBottomMv +
+   * holdExtraMv`, clamped to 100.
+   */
+  const holdExtraMv = useMotionValue(0);
+  const holdDrainAnimRef = useRef<AnimationPlaybackControls | null>(null);
+
+  /**
+   * Long-press fill opacity. 0 idle, 0→1 during charging, 1 during wiping/draining,
+   * 1→0 during fading. Drives the gradient's "dissolve in / dissolve out" so the
+   * grey wipe behind it can show through at the start and end.
+   */
+  const holdOpacityMv = useMotionValue(0);
+  const chargeOpacityAnimRef = useRef<AnimationPlaybackControls | null>(null);
+  const fadeOutAnimRef = useRef<AnimationPlaybackControls | null>(null);
+
+  /**
+   * Shake intensity for `ShakingLetter`. Two-step ramp: 0 → ~0.4 during charging
+   * (gentle buzz), then 0.4 → 1.0 during wiping (peaks as the fill nears the
+   * bottom). On release a quick fade brings it back to 0.
+   */
+  const shakeIntensityMv = useMotionValue(0);
+  const chargeShakeAnimRef = useRef<AnimationPlaybackControls | null>(null);
+  const shakeFadeAnimRef = useRef<AnimationPlaybackControls | null>(null);
 
   useEffect(() => {
     const fetchTasks = async () => {
@@ -248,22 +417,38 @@ const Index = () => {
 
   /**
    * Completion observer. Whenever any task's timer is at zero AND is no longer running,
-   * flag it as the completing task so the dissolve plays. Robust to React 18 batching:
-   * by the time this effect runs, both `timersByTaskId` and `completingTaskId` are
-   * committed, so we can't miss a transition.
+   * flag it as the completing task so the dissolve plays. We hold for `COMPLETION_PRE_DELAY_MS`
+   * first so the user gets a tiny "breath" on the normal screen with the timer at 0 and
+   * the task text in its regular state, before the dissolve animation starts.
    */
   useEffect(() => {
     if (completingTaskId !== null) {
       return;
     }
+    let toFinishId: number | null = null;
     for (const [idStr, t] of Object.entries(timersByTaskId)) {
       if (t.remainingSeconds === 0 && !t.isRunning) {
-        setCompletingTaskId(Number(idStr));
-        return;
+        toFinishId = Number(idStr);
+        break;
       }
     }
+    if (toFinishId === null) {
+      return;
+    }
+    const pendingId = toFinishId;
+    const timeoutId = window.setTimeout(() => {
+      setCompletingTaskId(pendingId);
+    }, COMPLETION_PRE_DELAY_MS);
+    return () => window.clearTimeout(timeoutId);
   }, [timersByTaskId, completingTaskId]);
 
+  /**
+   * Pre-completion breath. After the timer hits 0 we sit on the normal screen
+   * (timer label = 0:00, task text fully visible, no glow) for this long before
+   * triggering the dissolve. Lets the eye register "I'm done" before the
+   * animation starts, instead of cutting straight from running to fading.
+   */
+  const COMPLETION_PRE_DELAY_MS = 360;
   /**
    * How long the dissolve plays end-to-end. The keyframes below split this duration into
    * three beats:
@@ -273,12 +458,43 @@ const Index = () => {
    *             task's own color, glow off
    * Must match the `duration` on the dissolve transitions in the render below.
    */
-  const COMPLETION_DISSOLVE_MS = 1200;
+  const COMPLETION_DISSOLVE_MS = 1700;
   /**
    * Tiny breath we hold the now-faded task in place after the dissolve finishes, before the
    * slide-out kicks in. Keeps the eye from jumping straight from "fading" into "sliding".
    */
   const COMPLETION_HOLD_MS = 120;
+  /**
+   * Long-press tuning. Two-phase visual: first the gradient FADES IN over the
+   * existing wipe area (charging), then the fill bottom DESCENDS faster than the
+   * underlying wipe (wiping). On release the bar drains AND fades simultaneously
+   * (with a small offset) so the retreat and dissolve read as one motion.
+   *
+   *   - THRESHOLD                  : delay before any visual; shorter taps = play/pause.
+   *   - CHARGE_DURATION_MS         : opacity fade-in over the wipe (step 1 of shake).
+   *   - SHAKE_PHASE1_TARGET        : shake intensity at the end of charging.
+   *   - WIPING_BASE_PCT_PER_SEC    : descent speed at t=0 of the wiping phase.
+   *   - WIPING_ACCEL_PCT_PER_SEC2  : LINEAR acceleration. Velocity grows at a
+   *                                  constant rate (`v(t) = base + accel·t`), so
+   *                                  the speed-up is smooth and continuous — no
+   *                                  abrupt jolt at the start.
+   *   - DRAIN_DURATION_S           : tween (no spring) so the collapse has no
+   *                                  overshoot / extra bounce.
+   *   - RELEASE_FADE_DURATION_S    : duration of the gradient opacity dissolve on
+   *                                  release. Starts STRICTLY AFTER the drain ends
+   *                                  so the gradient never fades while still below
+   *                                  the wipe edge (otherwise the grey wipe would
+   *                                  peek through prematurely).
+   *   - SHAKE_FADE_MS              : per-letter shake fade on release.
+   */
+  const LONG_PRESS_THRESHOLD_MS = 220;
+  const CHARGE_DURATION_MS = 600;
+  const SHAKE_PHASE1_TARGET = 0.4;
+  const WIPING_BASE_PCT_PER_SEC = 25;
+  const WIPING_ACCEL_PCT_PER_SEC2 = 20;
+  const DRAIN_DURATION_S = 0.45;
+  const RELEASE_FADE_DURATION_S = 0.32;
+  const SHAKE_FADE_MS = 260;
 
   useEffect(() => {
     if (completingTaskId === null) {
@@ -465,44 +681,90 @@ const Index = () => {
   }, [tasks, currentIndex, committedCategoryByTaskId, categoryOrder, completingTaskId]);
 
   useEffect(() => {
-    const handleSpace = (event: KeyboardEvent) => {
-      if (event.code !== "Space") {
+    const cancelHoldRaf = () => {
+      if (holdRafRef.current !== null) {
+        cancelAnimationFrame(holdRafRef.current);
+        holdRafRef.current = null;
+      }
+    };
+    const cancelHoldTimeout = () => {
+      if (holdTimeoutRef.current !== null) {
+        window.clearTimeout(holdTimeoutRef.current);
+        holdTimeoutRef.current = null;
+      }
+    };
+    const cancelChargeOpacityAnim = () => {
+      if (chargeOpacityAnimRef.current !== null) {
+        chargeOpacityAnimRef.current.stop();
+        chargeOpacityAnimRef.current = null;
+      }
+    };
+    const cancelChargeShakeAnim = () => {
+      if (chargeShakeAnimRef.current !== null) {
+        chargeShakeAnimRef.current.stop();
+        chargeShakeAnimRef.current = null;
+      }
+    };
+    const cancelFadeOutAnim = () => {
+      if (fadeOutAnimRef.current !== null) {
+        fadeOutAnimRef.current.stop();
+        fadeOutAnimRef.current = null;
+      }
+    };
+    const cancelDrainAnim = () => {
+      if (holdDrainAnimRef.current !== null) {
+        holdDrainAnimRef.current.stop();
+        holdDrainAnimRef.current = null;
+      }
+    };
+    const cancelShakeFade = () => {
+      if (shakeFadeAnimRef.current !== null) {
+        shakeFadeAnimRef.current.stop();
+        shakeFadeAnimRef.current = null;
+      }
+    };
+    const startShakeFade = () => {
+      cancelShakeFade();
+      const from = shakeIntensityMv.get();
+      if (from <= 0) {
         return;
       }
+      shakeFadeAnimRef.current = animate(from, 0, {
+        duration: SHAKE_FADE_MS / 1000,
+        ease: "easeOut",
+        onUpdate: (v) => shakeIntensityMv.set(v),
+        onComplete: () => {
+          shakeIntensityMv.set(0);
+          shakeFadeAnimRef.current = null;
+        },
+      });
+    };
 
-      event.preventDefault();
-
-      if (tasks.length === 0) {
+    const togglePlayPause = () => {
+      const tasksNow = tasksRef.current;
+      const idxNow = currentIndexRef.current;
+      const completingNow = completingTaskIdRef.current;
+      const timersNow = timersByTaskIdRef.current;
+      if (tasksNow.length === 0 || completingNow !== null) {
         return;
       }
-
-      // Don't let space restart/pause anything while we're playing the completion animation.
-      if (completingTaskId !== null) {
+      const task = tasksNow[idxNow];
+      if (!task) {
         return;
       }
-
-      const task = tasks[currentIndex];
       const taskId = task.id;
-      const timerBeforeToggle = timersByTaskId[taskId] ?? defaultTimerForTask(task);
+      const timerBeforeToggle = timersNow[taskId] ?? defaultTimerForTask(task);
       const isStartingOrResuming = !timerBeforeToggle.isRunning;
-      const isFirstStart = timerBeforeToggle.remainingSeconds >= timerBeforeToggle.animationBaseSeconds;
+      const isFirstStart =
+        timerBeforeToggle.remainingSeconds >= timerBeforeToggle.animationBaseSeconds;
 
       setTimersByTaskId((prev) => {
-        const current =
-          prev[taskId] ?? defaultTimerForTask(task);
-
-        // PAUSE: freeze infill exactly where it is — touch nothing except isRunning
+        const current = prev[taskId] ?? defaultTimerForTask(task);
+        // PAUSE: freeze infill exactly where it is — touch nothing except isRunning.
         if (current.isRunning) {
-          return {
-            ...prev,
-            [taskId]: {
-              ...current,
-              isRunning: false,
-            },
-          };
+          return { ...prev, [taskId]: { ...current, isRunning: false } };
         }
-
-        // RESUME / START: activate this task; reset other tasks' infill to 100%
+        // RESUME / START: activate this task; reset other tasks' infill to 100%.
         const next: Record<number, TaskTimer> = {};
         for (const [id, timer] of Object.entries(prev)) {
           const numId = Number(id);
@@ -516,7 +778,6 @@ const Index = () => {
             };
           }
         }
-
         return next;
       });
 
@@ -528,12 +789,358 @@ const Index = () => {
       }
     };
 
-    window.addEventListener("keydown", handleSpace);
+    const forceCompleteCurrentTask = () => {
+      const tasksNow = tasksRef.current;
+      const idxNow = currentIndexRef.current;
+      const completingNow = completingTaskIdRef.current;
+      if (tasksNow.length === 0 || completingNow !== null) {
+        return;
+      }
+      const task = tasksNow[idxNow];
+      if (!task) {
+        return;
+      }
+      // Stop the timer first so the existing completion observer doesn't double-fire.
+      setTimersByTaskId((prev) => {
+        const t = prev[task.id];
+        if (!t) {
+          return prev;
+        }
+        return { ...prev, [task.id]: { ...t, isRunning: false } };
+      });
+      setCompletingTaskId(task.id);
+    };
+
+    /**
+     * Phase 1: charging. The gradient fades IN over the existing wipe area —
+     * `holdExtraMv` stays at 0 (no descent below the wipe yet) so the fill height
+     * exactly tracks `wipeBottomMv`. Visually the wipe "transforms" into the
+     * gradient as opacity ramps to 1. Letters begin buzzing (shake step 1).
+     *
+     * On completion of the opacity ramp we automatically advance to wiping. If the
+     * user releases mid-charge we go straight to fading (skip drain, since
+     * `holdExtraMv` is already 0).
+     */
+    const enterCharging = () => {
+      cancelDrainAnim();
+      cancelFadeOutAnim();
+      cancelChargeOpacityAnim();
+      cancelChargeShakeAnim();
+      cancelShakeFade();
+      cancelHoldRaf();
+
+      holdStateRef.current = "charging";
+      // No extra descent during charging — fill clings to the wipe.
+      holdExtraMv.set(0);
+
+      const fromOpacity = holdOpacityMv.get();
+      const remainingMs = Math.max(0, (1 - fromOpacity) * CHARGE_DURATION_MS);
+      const fromShake = shakeIntensityMv.get();
+
+      if (remainingMs <= 0) {
+        // Already fully opaque (e.g. mid-fade re-press). Skip charging.
+        holdOpacityMv.set(1);
+        if (fromShake < SHAKE_PHASE1_TARGET) {
+          shakeIntensityMv.set(SHAKE_PHASE1_TARGET);
+        }
+        enterWiping();
+        return;
+      }
+
+      chargeOpacityAnimRef.current = animate(holdOpacityMv, 1, {
+        duration: remainingMs / 1000,
+        ease: "easeOut",
+        onComplete: () => {
+          chargeOpacityAnimRef.current = null;
+          if (holdStateRef.current === "charging") {
+            enterWiping();
+          }
+        },
+      });
+
+      // Shake step 1 — gentle buzz that lands at SHAKE_PHASE1_TARGET right when
+      // the charge completes (so step 2 picks up seamlessly).
+      const shakeTarget = Math.max(fromShake, SHAKE_PHASE1_TARGET);
+      chargeShakeAnimRef.current = animate(shakeIntensityMv, shakeTarget, {
+        duration: remainingMs / 1000,
+        ease: "easeOut",
+        onComplete: () => {
+          chargeShakeAnimRef.current = null;
+        },
+      });
+    };
+
+    /**
+     * Phase 2: wiping. Once charged, `holdExtraMv` grows under a constant LINEAR
+     * acceleration: `velocity(t) = base + accel·t`. da/dt is constant so the
+     * speed-up is smooth and continuous — no abrupt jolt at any instant. When
+     * `wipeBottomMv + holdExtraMv` reaches 100 %, trigger completion.
+     *
+     * Letters intensify here — shake step 2, ramping from `SHAKE_PHASE1_TARGET`
+     * up to 1.0 as the fill nears the bottom of the screen.
+     */
+    const enterWiping = () => {
+      if (completingTaskIdRef.current !== null) {
+        return;
+      }
+      holdStateRef.current = "wiping";
+      holdOpacityMv.set(1);
+      const now0 = performance.now();
+      wipingLastTickRef.current = now0;
+      wipingPhaseStartRef.current = now0;
+
+      const tick = () => {
+        if (holdStateRef.current !== "wiping") {
+          return;
+        }
+        const now = performance.now();
+        const dt = (now - wipingLastTickRef.current) / 1000;
+        wipingLastTickRef.current = now;
+
+        const tSec = (now - wipingPhaseStartRef.current) / 1000;
+        const rate =
+          WIPING_BASE_PCT_PER_SEC + WIPING_ACCEL_PCT_PER_SEC2 * tSec;
+        const nextExtra = holdExtraMv.get() + rate * dt;
+        holdExtraMv.set(nextExtra);
+
+        const fillBottom = wipeBottomMv.get() + nextExtra;
+        // Shake step 2 — interpolate from SHAKE_PHASE1_TARGET to 1.0 based on
+        // how close the fill bottom is to the screen bottom.
+        const phase2Progress = Math.max(
+          0,
+          Math.min(1, fillBottom / 100)
+        );
+        shakeIntensityMv.set(
+          SHAKE_PHASE1_TARGET + phase2Progress * (1 - SHAKE_PHASE1_TARGET)
+        );
+
+        if (fillBottom >= 100) {
+          holdStateRef.current = "idle";
+          holdExtraMv.set(0);
+          holdOpacityMv.set(0);
+          shakeIntensityMv.set(0);
+          forceCompleteCurrentTask();
+          return;
+        }
+        holdRafRef.current = requestAnimationFrame(tick);
+      };
+      holdRafRef.current = requestAnimationFrame(tick);
+    };
+
+    /**
+     * Release path. Strictly SEQUENTIAL: drain first (extra → 0, fully glued to
+     * the wipe edge), only then fade (opacity → 0). Overlapping the two would
+     * let the underlying grey wipe peek through the gradient while the bottom
+     * edge is still below the wipe line — visually wrong.
+     *
+     * If the user releases during charging (`holdExtraMv` is still ~0) we skip
+     * the drain entirely and just fade out.
+     *
+     * Runs in parallel with a per-letter shake fade.
+     */
+    const startReleaseSequence = () => {
+      const state = holdStateRef.current;
+      if (state === "idle" || state === "draining" || state === "fading") {
+        return;
+      }
+      cancelHoldRaf();
+      cancelChargeOpacityAnim();
+      cancelChargeShakeAnim();
+      cancelDrainAnim();
+      cancelFadeOutAnim();
+      startShakeFade();
+
+      const extra = holdExtraMv.get();
+      if (extra <= 0.05) {
+        // Released during charging — no descent below wipe yet, just fade.
+        enterFading();
+        return;
+      }
+
+      holdStateRef.current = "draining";
+
+      holdDrainAnimRef.current = animate(holdExtraMv, 0, {
+        type: "tween",
+        duration: DRAIN_DURATION_S,
+        ease: [0.4, 0, 0.2, 1],
+        onComplete: () => {
+          holdDrainAnimRef.current = null;
+          holdExtraMv.set(0);
+          if (holdStateRef.current === "draining") {
+            enterFading();
+          }
+        },
+      });
+    };
+
+    const enterFading = () => {
+      cancelFadeOutAnim();
+      holdStateRef.current = "fading";
+      holdExtraMv.set(0);
+
+      const fromOpacity = holdOpacityMv.get();
+      if (fromOpacity <= 0) {
+        holdStateRef.current = "idle";
+        holdOpacityMv.set(0);
+        return;
+      }
+
+      fadeOutAnimRef.current = animate(holdOpacityMv, 0, {
+        type: "tween",
+        duration: (fromOpacity / 1) * RELEASE_FADE_DURATION_S,
+        ease: "easeOut",
+        onComplete: () => {
+          fadeOutAnimRef.current = null;
+          holdOpacityMv.set(0);
+          if (holdStateRef.current === "fading") {
+            holdStateRef.current = "idle";
+          }
+        },
+      });
+    };
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.code !== "Space") {
+        return;
+      }
+      event.preventDefault();
+      // Browser auto-repeat fires keydown over and over while held — ignore everything
+      // except the very first one.
+      if (event.repeat) {
+        return;
+      }
+      if (tasksRef.current.length === 0) {
+        return;
+      }
+      if (completingTaskIdRef.current !== null) {
+        return;
+      }
+
+      isPressingRef.current = true;
+      cancelHoldTimeout();
+
+      // Schedule charging to begin only AFTER the threshold. Short taps never
+      // reach this point because keyup will clear the timeout and fire
+      // togglePlayPause instead.
+      holdTimeoutRef.current = window.setTimeout(() => {
+        holdTimeoutRef.current = null;
+        if (!isPressingRef.current) {
+          return;
+        }
+        if (completingTaskIdRef.current !== null) {
+          return;
+        }
+        enterCharging();
+      }, LONG_PRESS_THRESHOLD_MS);
+    };
+
+    const handleKeyUp = (event: KeyboardEvent) => {
+      if (event.code !== "Space") {
+        return;
+      }
+      // The threshold timeout still pending = this was a quick tap (toggle play/pause).
+      const wasShortTap = holdTimeoutRef.current !== null;
+      isPressingRef.current = false;
+
+      if (wasShortTap) {
+        cancelHoldTimeout();
+        togglePlayPause();
+        return;
+      }
+
+      // Past the threshold: drain (if needed) then dissolve back to the grey wipe.
+      startReleaseSequence();
+    };
+
+    // If the user alt-tabs / clicks away mid-hold the OS may swallow the keyup. Treat a
+    // window blur the same as a release so we don't leave the bar stuck on screen.
+    const handleWindowBlur = () => {
+      if (!isPressingRef.current && holdStateRef.current === "idle") {
+        return;
+      }
+      isPressingRef.current = false;
+      cancelHoldTimeout();
+      startReleaseSequence();
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleWindowBlur);
 
     return () => {
-      window.removeEventListener("keydown", handleSpace);
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleWindowBlur);
+      cancelHoldTimeout();
+      cancelHoldRaf();
+      cancelShakeFade();
+      cancelDrainAnim();
+      cancelChargeOpacityAnim();
+      cancelChargeShakeAnim();
+      cancelFadeOutAnim();
     };
-  }, [tasks, currentIndex, completingTaskId, timersByTaskId]);
+  }, []);
+
+  /**
+   * Cancel any in-flight hold animation if (a) the user navigates to a different task or
+   * (b) something else triggers the completion animation (e.g. timer hits zero on its own).
+   * Otherwise the rising bar would stay on screen and possibly force-complete the wrong task.
+   */
+  useEffect(() => {
+    const hasInflight =
+      holdStateRef.current !== "idle" ||
+      holdTimeoutRef.current !== null ||
+      holdExtraMv.get() > 0 ||
+      holdOpacityMv.get() > 0 ||
+      shakeIntensityMv.get() > 0 ||
+      shakeFadeAnimRef.current !== null ||
+      holdDrainAnimRef.current !== null ||
+      chargeOpacityAnimRef.current !== null ||
+      chargeShakeAnimRef.current !== null ||
+      fadeOutAnimRef.current !== null;
+    if (!hasInflight) {
+      return;
+    }
+    if (holdRafRef.current !== null) {
+      cancelAnimationFrame(holdRafRef.current);
+      holdRafRef.current = null;
+    }
+    if (holdTimeoutRef.current !== null) {
+      window.clearTimeout(holdTimeoutRef.current);
+      holdTimeoutRef.current = null;
+    }
+    if (chargeOpacityAnimRef.current !== null) {
+      chargeOpacityAnimRef.current.stop();
+      chargeOpacityAnimRef.current = null;
+    }
+    if (chargeShakeAnimRef.current !== null) {
+      chargeShakeAnimRef.current.stop();
+      chargeShakeAnimRef.current = null;
+    }
+    if (fadeOutAnimRef.current !== null) {
+      fadeOutAnimRef.current.stop();
+      fadeOutAnimRef.current = null;
+    }
+    if (shakeFadeAnimRef.current !== null) {
+      shakeFadeAnimRef.current.stop();
+      shakeFadeAnimRef.current = null;
+    }
+    if (holdDrainAnimRef.current !== null) {
+      holdDrainAnimRef.current.stop();
+      holdDrainAnimRef.current = null;
+    }
+    holdStateRef.current = "idle";
+    holdExtraMv.set(0);
+    holdOpacityMv.set(0);
+    shakeIntensityMv.set(0);
+    isPressingRef.current = false;
+  }, [
+    currentIndex,
+    completingTaskId,
+    holdExtraMv,
+    holdOpacityMv,
+    shakeIntensityMv,
+  ]);
 
   useEffect(() => {
     if (spaceFeedback === null) {
@@ -565,6 +1172,52 @@ const Index = () => {
     ? formatRemainingAsMinutesLabel(currentTimer.remainingSeconds)
     : "";
 
+  /**
+   * Drive `wipeBottomMv` continuously between timer ticks. When running we ramp
+   * linearly over the full 1 s tick interval (matching the old CSS transition); when
+   * paused/idle we snap so a paused wipe doesn't keep gliding.
+   *
+   * This is what fixes the "long press starts ahead of the wipe" bug: both the wipe
+   * element and the long-press fill's top read off the same continuously-interpolated
+   * motion value, so they line up to the pixel.
+   */
+  const isWipeRunning = currentTimer?.isRunning === true;
+  useEffect(() => {
+    const target = Math.min(100, Math.max(0, 100 - fillPercentage));
+    if (wipeAnimRef.current) {
+      wipeAnimRef.current.stop();
+      wipeAnimRef.current = null;
+    }
+    if (isWipeRunning) {
+      wipeAnimRef.current = animate(wipeBottomMv, target, {
+        duration: 1,
+        ease: "linear",
+        onComplete: () => {
+          wipeAnimRef.current = null;
+        },
+      });
+    } else {
+      wipeBottomMv.set(target);
+    }
+  }, [fillPercentage, isWipeRunning, wipeBottomMv]);
+
+  /**
+   * Long-press fill geometry. The fill is top-anchored at 0 (same as the wipe)
+   * and its height = `wipeBottomMv + holdExtraMv`, clamped to 100. So during
+   * charging/fading (extra=0) it sits exactly on top of the wipe; during wiping
+   * it dips below by `holdExtraMv`; during draining it shrinks back to the wipe
+   * edge. Opacity is driven by `holdOpacityMv` for the dissolve in/out.
+   */
+  const wipeHeightStr = useMotionTemplate`${wipeBottomMv}%`;
+  const holdHeightPct = useTransform(
+    [wipeBottomMv, holdExtraMv],
+    (latest) => {
+      const [w, e] = latest as [number, number];
+      return Math.min(100, Math.max(0, w + e));
+    }
+  );
+  const holdHeightStr = useMotionTemplate`${holdHeightPct}%`;
+
   useEffect(() => {
     if (tasks.length === 0) {
       return;
@@ -587,16 +1240,62 @@ const Index = () => {
   return (
     <div className="relative flex min-h-screen w-full items-center justify-center overflow-hidden bg-mandu-bg text-mandu-white">
 
-      {/* Full-screen color wipe — drains downward as time passes */}
+      {/* Full-screen color wipe — drains downward as time passes. Height is driven
+          off the shared `wipeBottomMv` motion value (see the sync `useEffect` above)
+          so it interpolates continuously between the once-per-second `fillPercentage`
+          ticks AND so the long-press fill's top can read the same value to line up
+          to the pixel. */}
       {tasks.length > 0 && isTimerActive && (
-        <div
+        <motion.div
           className="pointer-events-none absolute inset-x-0 top-0 z-0"
           style={{
-            height: `${Math.min(100, Math.max(0, 100 - fillPercentage))}%`,
+            height: wipeHeightStr,
             backgroundColor: "#EDEBD7",
             opacity: 0.08,
-            // Freeze instantly on pause; keep smooth drip while running.
-            transition: currentTimer?.isRunning ? "height 1s linear" : "none",
+          }}
+        />
+      )}
+
+      {/* Hold-to-complete: top-anchored gradient overlay sharing the wipe's exact
+          area. Two-phase animation:
+            - Charging  : opacity ramps 0→1 IN-PLACE over the wipe (extra=0).
+                          Visually the grey wipe "transforms" into the gradient.
+            - Wiping    : extra grows below the wipe so the bright bottom edge
+                          descends faster than the natural wipe rate.
+            - Draining  : extra eases back to 0 (no spring bounce) on release.
+            - Fading    : opacity ramps back to 0, revealing the regular grey wipe.
+          Height = `wipeBottomMv + holdExtraMv` (clamped 100), so it ALWAYS follows
+          the wipe pixel-perfect in every phase. Square corners; the leading edge
+          is in the gradient itself. */}
+      {tasks.length > 0 && (
+        <motion.div
+          className="pointer-events-none absolute inset-x-0 top-0 z-0"
+          style={{
+            height: holdHeightStr,
+            opacity: holdOpacityMv,
+            /* Stops are fully opaque (no see-through to the base timer wipe).
+               Top stop (#2F2E2D) is the EXACT pre-mix of `bg-mandu-bg #1E1E1E`
+               with the wipe overlay `#EDEBD7 @ 8%`, so the joint between the
+               regular wipe area and the charged gradient at top is invisible.
+               background-size 100%×100vh + no-repeat anchors the gradient to the
+               viewport so it does NOT stretch as the fill height grows — the div
+               just reveals more of a fixed 100vh image (so the color you see at
+               the leading edge naturally brightens as the fill descends). */
+            background:
+              "linear-gradient(to bottom, " +
+              "#2F2E2D 0%, " +
+              "#4A3F2A 8%, " +
+              "#7A5F2F 18%, " +
+              "#A77F37 30%, " +
+              "#C99A3A 44%, " +
+              "#E3B23C 60%, " +
+              "#F0C14F 74%, " +
+              "#F8DA80 86%, " +
+              "#FFF0C8 95%, " +
+              "#FFFFFF 100%)",
+            backgroundSize: "100% 100vh",
+            backgroundRepeat: "no-repeat",
+            backgroundPosition: "top left",
           }}
         />
       )}
@@ -704,9 +1403,26 @@ const Index = () => {
                    *                 (cream halo lingers through the hold, then fades out)
                    * No scale, no x/y, no letter-spacing — the text doesn't move.
                    */}
+                  {/*
+                    * Parent stays inline and only animates color / opacity / textShadow
+                    * for the completion dissolve — those properties inherit through CSS
+                    * down to every per-letter `ShakingLetter`, so all letters fade and
+                    * glow in sync without us repeating the keyframes 30+ times. The
+                    * shake itself is per-letter (each letter has its own phased motion
+                    * values), giving the chaotic "letras a vibrar separadamente" look
+                    * the user asked for.
+                    *
+                    * Layout strategy: split the text on whitespace, wrap each word in
+                    * an `inline-block` + `whiteSpace: nowrap` span (so word integrity
+                    * is preserved at line breaks, but adjacent letters inside a word
+                    * never break apart), and render each character as a `ShakingLetter`
+                    * inline-block (mandatory for transforms to apply).
+                    */}
                   <motion.span
                     className="break-words font-black"
-                    style={{ color: currentTaskColor, display: "inline" }}
+                    style={{
+                      color: currentTaskColor,
+                    }}
                     animate={
                       isCurrentTaskCompleting
                         ? {
@@ -738,7 +1454,45 @@ const Index = () => {
                       ease: "easeInOut",
                     }}
                   >
-                    {currentTask.text}
+                    {(() => {
+                      const segments = currentTask.text.split(/(\s+)/);
+                      let letterCounter = 0;
+                      return segments.map((seg, sIdx) => {
+                        if (seg === "") {
+                          return null;
+                        }
+                        if (/^\s+$/.test(seg)) {
+                          return (
+                            <span key={`s-${sIdx}`}>{seg}</span>
+                          );
+                        }
+                        return (
+                          <span
+                            key={`w-${sIdx}`}
+                            style={{
+                              display: "inline-block",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {Array.from(seg).map((char, cIdx) => {
+                              const idx = letterCounter++;
+                              return (
+                                <ShakingLetter
+                                  key={cIdx}
+                                  char={char}
+                                  letterIndex={idx}
+                                  time={time}
+                                  shakeIntensityMv={shakeIntensityMv}
+                                  taskColor={currentTaskColor}
+                                  isCompleting={isCurrentTaskCompleting}
+                                  completionDurationMs={COMPLETION_DISSOLVE_MS}
+                                />
+                              );
+                            })}
+                          </span>
+                        );
+                      });
+                    })()}
                   </motion.span>
                 </div>
               </motion.div>
