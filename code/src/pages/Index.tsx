@@ -938,6 +938,9 @@ const Index = () => {
         if (current.isRunning) {
           const live = liveRemaining(current);
           persistCurrentTimeSeconds(taskId, live);
+          // If user pauses while one-shot "started!/continuing" is visible,
+          // drop it immediately so the looping "paused" hint appears right away.
+          setSpaceFeedback(null);
           return {
             ...prev,
             [taskId]: {
@@ -1797,8 +1800,9 @@ const Index = () => {
         <motion.div
           key={`status-hint-${isTimerActive ? "paused" : "idle"}`}
           className="absolute bottom-12 left-1/2 z-30 -translate-x-1/2 select-none text-lg font-thin tracking-wide text-mandu-white/80"
-          initial={{ opacity: 0.25 }}
-          animate={{ opacity: [0.25, 1, 0.25] }}
+          // For paused, show at full opacity immediately (no first fade-in).
+          initial={{ opacity: isTimerActive ? 1 : 0.25 }}
+          animate={{ opacity: isTimerActive ? [1, 0.25, 1] : [0.25, 1, 0.25] }}
           transition={{
             duration: isTimerActive ? 2.2 : 3.1,
             ease: "easeInOut",
@@ -1818,7 +1822,6 @@ const Index = () => {
             className="absolute bottom-12 left-1/2 z-30 -translate-x-1/2 select-none text-lg font-thin tracking-wide text-mandu-white/80"
             initial={{ opacity: 1 }}
             animate={{ opacity: [1, 1, 0] }}
-            exit={{ opacity: 0 }}
             transition={{ duration: 2.1, ease: "easeInOut", times: [0, 0.35, 1] }}
           >
             {spaceFeedback.text}

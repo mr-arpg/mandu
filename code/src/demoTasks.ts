@@ -22,9 +22,9 @@ export const DEMO_TASK_ROWS: DemoTaskRow[] = [
   {
     id: 2,
     category: "demo",
-    time: "30 sec",
+    time: "20 sec",
     text: "hit space again after starting a task to pause it!",
-    current_time: "30 sec",
+    current_time: "20 sec",
   },
   {
     id: 3,
