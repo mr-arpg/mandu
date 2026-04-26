@@ -1,4 +1,4 @@
-# mandu
+# 🥟 mandu 
 
 A keyboard-first, single-task-at-a-time timer. Each task takes the whole
 screen, drains a wipe from top to bottom over its duration, and lets you flip
@@ -24,10 +24,10 @@ mandu/
 
 ## Controls
 
-- **Space** — start / pause the current task's timer.
-- **Left / Right** — switch to the previous / next task.
-- **Up / Down** — cycle the current task's category (and color).
-- **Long-press Space** — force-complete the current task.
+- <kbd>Space</kbd> — start / pause the current task's timer.
+- <kbd>←</kbd> / <kbd>→</kbd> — switch to the previous / next task.
+- <kbd>↑</kbd> / <kbd>↓</kbd> — cycle the current task's category (and color).
+- Long-press <kbd>Space</kbd> — force-complete the current task.
 
 ## Running locally (full stack)
 
